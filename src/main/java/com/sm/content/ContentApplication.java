@@ -4,18 +4,38 @@ import io.github.cdimascio.dotenv.Dotenv;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 
+/**
+ * Entry point for the Content Service microservice.
+ *
+ * <p>Flow: Initializes the Spring Boot application, loading local environment variables before
+ * starting the context.
+ *
+ * <p>Features: Main service runner for handling post content, media, and engagement.
+ */
 @SpringBootApplication
 public class ContentApplication {
 
+  /**
+   * Main method to launch the application.
+   *
+   * <p>Flow: Calls loadLocalEnvFile to prepare the environment, then executes SpringApplication.run.
+   *
+   * <p>Features: Bootstraps the microservice.
+   *
+   * @param args Command line arguments
+   */
   public static void main(String[] args) {
     loadLocalEnvFile();
     SpringApplication.run(ContentApplication.class, args);
   }
 
   /**
-   * Loads {@code .env} from the working directory (e.g. {@code content-service/}) so AWS and
-   * other vars are available to Spring without exporting them in the shell. Real environment
-   * variables always win over {@code .env}.
+   * Loads {@code .env} from the working directory.
+   *
+   * <p>Flow: Uses Dotenv to read the .env file. It iterates through the entries and sets them as
+   * system properties if they aren't already defined in the environment or system properties.
+   *
+   * <p>Features: Local configuration management for AWS credentials and other secrets.
    */
   private static void loadLocalEnvFile() {
     Dotenv dotenv =

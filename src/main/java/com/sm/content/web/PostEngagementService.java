@@ -1,151 +1,284 @@
 package com.sm.content.web;
 
-import com.sm.content.client.ProfileServiceClient;
-import com.sm.content.client.PublicUserDto;
 import com.sm.content.domain.PostCommentEntity;
 import com.sm.content.domain.PostCommentRepository;
+import com.sm.content.domain.PostEntity;
 import com.sm.content.domain.PostLikeEntity;
 import com.sm.content.domain.PostLikeRepository;
 import com.sm.content.domain.PostRepository;
 import com.sm.content.domain.SavedPostEntity;
 import com.sm.content.domain.SavedPostRepository;
+import com.sm.content.client.ProfileServiceClient;
+import com.sm.content.client.PublicUserDto;
 import com.sm.content.web.dto.CommentResponse;
 import com.sm.content.web.dto.EngagementResponse;
 import com.sm.content.web.dto.LikersResponse;
 import java.time.Instant;
-import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
-import java.util.UUID;
-import org.springframework.http.HttpStatus;
+import java.util.Map;
+import java.util.Optional;
+import java.util.stream.Collectors;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
 import org.springframework.stereotype.Service;
-import org.springframework.web.server.ResponseStatusException;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.client.RestTemplate;
+import lombok.extern.slf4j.Slf4j;
 
+/**
+ * Service for managing user engagement with posts, including likes, comments, and saves.
+ *
+ * <p>Flow: This service interacts with multiple repositories (PostRepository, PostLikeRepository,
+ * PostCommentRepository, SavedPostRepository) to retrieve and persist engagement data. It
+ * aggregates counts and user-specific status for the web layer.
+ *
+ * <p>Features: Supports post like/unlike, commenting, saving/unsaving posts, and retrieving
+ * engagement metrics for a post.
+ */
 @Service
+@Slf4j
 public class PostEngagementService {
-
-  private static final int MAX_LIKERS = 100;
 
   private final PostRepository postRepository;
   private final PostLikeRepository likeRepository;
   private final PostCommentRepository commentRepository;
-  private final SavedPostRepository savedRepository;
+  private final SavedPostRepository savedPostRepository;
   private final ProfileServiceClient profileClient;
+  private final RestTemplate restTemplate = new RestTemplate();
 
+  @Value("${internal.secret:defaultSecret}")
+  private String internalSecret;
+
+  /**
+   * Constructs the PostEngagementService.
+   *
+   * @param postRepository Repository for post data
+   * @param likeRepository Repository for post likes
+   * @param commentRepository Repository for post comments
+   * @param savedPostRepository Repository for saved posts
+   */
   public PostEngagementService(
       PostRepository postRepository,
       PostLikeRepository likeRepository,
       PostCommentRepository commentRepository,
-      SavedPostRepository savedRepository,
+      SavedPostRepository savedPostRepository,
       ProfileServiceClient profileClient) {
     this.postRepository = postRepository;
     this.likeRepository = likeRepository;
     this.commentRepository = commentRepository;
-    this.savedRepository = savedRepository;
+    this.savedPostRepository = savedPostRepository;
     this.profileClient = profileClient;
   }
 
-  public EngagementResponse getEngagement(long postId, Long viewerUserId) {
-    ensurePostExists(postId);
-    EngagementResponse out = new EngagementResponse();
-    out.setLikeCount(likeRepository.countByPostId(postId));
-    if (viewerUserId != null) {
-      out.setLiked(likeRepository.findByPostIdAndUserId(postId, viewerUserId).isPresent());
-      out.setSaved(savedRepository.findByPostIdAndUserId(postId, viewerUserId).isPresent());
-    } else {
-      out.setLiked(false);
-      out.setSaved(false);
+  /**
+   * Retrieves engagement metrics for a specific post.
+   *
+   * <p>Flow: Queries like and comment repositories for total counts. If a viewerId is provided,
+   * it also checks if that user has liked or saved the post.
+   *
+   * <p>Features: Provides a consolidated view of post popularity and user-specific engagement state.
+   *
+   * @param postId The ID of the post
+   * @param viewerId The ID of the user viewing the post (optional)
+   * @return EngagementResponse containing counts and status
+   */
+  public EngagementResponse getEngagement(long postId, Long viewerId) {
+    long likeCount = likeRepository.countByPostId(postId);
+    long commentCount = commentRepository.countByPostId(postId);
+
+    boolean liked = false;
+    boolean saved = false;
+
+    if (viewerId != null) {
+      liked = likeRepository.findByPostIdAndUserId(postId, viewerId).isPresent();
+      saved = savedPostRepository.findByPostIdAndUserId(postId, viewerId).isPresent();
     }
-    List<CommentResponse> comments = new ArrayList<>();
-    for (PostCommentEntity c : commentRepository.findByPostIdOrderByCreatedAtAsc(postId)) {
-      comments.add(toCommentResponse(c));
-    }
-    out.setComments(comments);
-    return out;
+
+    EngagementResponse res = new EngagementResponse();
+    res.setPostId(postId);
+    res.setLikeCount(likeCount);
+    res.setCommentCount(commentCount);
+    res.setLiked(liked);
+    res.setSaved(saved);
+    return res;
   }
 
+  /**
+   * Lists users who have liked a specific post.
+   *
+   * <p>Flow: Fetches like entities for the post and extracts the user IDs, limited by the specified amount.
+   *
+   * <p>Features: Allows displaying a sample of users who interacted with the post.
+   *
+   * @param postId The ID of the post
+   * @param limit Maximum number of user IDs to return
+   * @return LikersResponse containing the list of user IDs
+   */
   public LikersResponse listLikers(long postId, int limit) {
-    ensurePostExists(postId);
-    int cap = Math.min(Math.max(limit, 1), MAX_LIKERS);
-    LikersResponse out = new LikersResponse();
-    List<PostLikeEntity> likes = likeRepository.findByPostIdOrderByCreatedAtDesc(postId);
-    List<PublicUserDto> users = new ArrayList<>();
-    int n = 0;
-    for (PostLikeEntity like : likes) {
-      if (n >= cap) break;
-      users.add(profileClient.getPublicProfile(like.getUserId()));
-      n++;
-    }
-    out.setUsers(users);
-    return out;
+    List<Long> userIds = likeRepository.findByPostId(postId).stream()
+        .map(PostLikeEntity::getUserId)
+        .limit(limit)
+        .collect(Collectors.toList());
+
+    List<PublicUserDto> users = userIds.stream()
+        .map(profileClient::getPublicProfile)
+        .collect(Collectors.toList());
+
+    LikersResponse res = new LikersResponse();
+    res.setPostId(postId);
+    res.setUserIds(userIds);
+    res.setUsers(users);
+    return res;
   }
 
+  /**
+   * Adds a like to a post by a user.
+   *
+   * <p>Flow: Checks if a like already exists for the user/post combination. If not, creates and
+   * saves a new PostLikeEntity.
+   *
+   * <p>Features: Implements the 'Like' functionality for posts.
+   *
+   * @param postId The ID of the post to like
+   * @param userId The ID of the user liking the post
+   */
+  @Transactional
   public void like(long postId, long userId) {
-    ensurePostExists(postId);
     if (likeRepository.findByPostIdAndUserId(postId, userId).isPresent()) {
       return;
     }
-    PostLikeEntity e = new PostLikeEntity();
-    e.setId(UUID.randomUUID().toString());
-    e.setPostId(postId);
-    e.setUserId(userId);
-    e.setCreatedAt(Instant.now());
-    likeRepository.save(e);
+    PostLikeEntity entity = new PostLikeEntity();
+    entity.setPostId(postId);
+    entity.setUserId(userId);
+    entity.setCreatedAt(Instant.now());
+    likeRepository.save(entity);
+
+    // Trigger notification
+    postRepository.findById(postId).ifPresent(post -> {
+        if (!post.getAuthorId().equals(userId)) {
+            PublicUserDto liker = profileClient.getPublicProfile(userId);
+            String name = (liker != null && liker.getUsername() != null) ? liker.getUsername() : "Someone";
+            sendNotification(post.getAuthorId(), "PUSH", "New Like", name + " liked your post!");
+        }
+    });
   }
 
+  /**
+   * Removes a like from a post by a user.
+   *
+   * <p>Flow: Searches for an existing like and deletes it if found.
+   *
+   * <p>Features: Implements the 'Unlike' functionality for posts.
+   *
+   * @param postId The ID of the post to unlike
+   * @param userId The ID of the user unliking the post
+   */
+  @Transactional
   public void unlike(long postId, long userId) {
-    ensurePostExists(postId);
-    likeRepository.deleteByPostIdAndUserId(postId, userId);
+    likeRepository.findByPostIdAndUserId(postId, userId)
+        .ifPresent(likeRepository::delete);
   }
 
+  /**
+   * Adds a comment to a post.
+   *
+   * <p>Flow: Creates a new PostCommentEntity with the provided text and metadata, saves it to the
+   * database, and returns a DTO representation.
+   *
+   * <p>Features: Enables user discussion and feedback on posts.
+   *
+   * @param postId The ID of the post
+   * @param userId The ID of the user commenting
+   * @param text The content of the comment
+   * @return CommentResponse representing the newly created comment
+   */
+  @Transactional
   public CommentResponse addComment(long postId, long userId, String text) {
-    ensurePostExists(postId);
-    String trimmed = text.trim();
-    if (trimmed.isEmpty()) {
-      throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Empty comment");
-    }
-    if (trimmed.length() > 2200) {
-      throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Comment too long");
-    }
-    PostCommentEntity e = new PostCommentEntity();
-    e.setId(UUID.randomUUID().toString());
-    e.setPostId(postId);
-    e.setUserId(userId);
-    e.setText(trimmed);
-    e.setCreatedAt(Instant.now());
-    commentRepository.save(e);
-    return toCommentResponse(e);
+    PostCommentEntity entity = new PostCommentEntity();
+    entity.setPostId(postId);
+    entity.setUserId(userId);
+    entity.setText(text);
+    entity.setCreatedAt(Instant.now());
+    PostCommentEntity saved = commentRepository.save(entity);
+
+    CommentResponse res = new CommentResponse();
+    res.setId(saved.getId());
+    res.setPostId(postId);
+    res.setUserId(userId);
+    res.setText(text);
+    res.setCreatedAt(saved.getCreatedAt());
+    
+    // Enrich with user profile so the frontend displays the correct name immediately
+    res.setUser(profileClient.getPublicProfile(userId));
+
+    // Trigger notification
+    postRepository.findById(postId).ifPresent(post -> {
+        if (!post.getAuthorId().equals(userId)) {
+            PublicUserDto commenter = profileClient.getPublicProfile(userId);
+            String name = (commenter != null && commenter.getUsername() != null) ? commenter.getUsername() : "Someone";
+            sendNotification(post.getAuthorId(), "PUSH", "New Comment", name + " commented on your post!");
+        }
+    });
+
+    return res;
   }
 
+  /**
+   * Saves a post to a user's collection.
+   *
+   * <p>Flow: Checks if the post is already saved by the user. If not, creates and persists a
+   * SavedPostEntity.
+   *
+   * <p>Features: Allows users to bookmark posts for later viewing.
+   *
+   * @param postId The ID of the post to save
+   * @param userId The ID of the user saving the post
+   */
+  @Transactional
   public void savePost(long postId, long userId) {
-    ensurePostExists(postId);
-    if (savedRepository.findByPostIdAndUserId(postId, userId).isPresent()) {
+    if (savedPostRepository.findByPostIdAndUserId(postId, userId).isPresent()) {
       return;
     }
-    SavedPostEntity e = new SavedPostEntity();
-    e.setId(UUID.randomUUID().toString());
-    e.setPostId(postId);
-    e.setUserId(userId);
-    e.setCreatedAt(Instant.now());
-    savedRepository.save(e);
+    SavedPostEntity entity = new SavedPostEntity();
+    entity.setPostId(postId);
+    entity.setUserId(userId);
+    entity.setCreatedAt(Instant.now());
+    savedPostRepository.save(entity);
   }
 
+  /**
+   * Removes a post from a user's saved collection.
+   *
+   * <p>Flow: Locates the saved post entry for the user/post pair and deletes it if it exists.
+   *
+   * <p>Features: Allows users to manage their saved posts.
+   *
+   * @param postId The ID of the post to unsave
+   * @param userId The ID of the user unsaving the post
+   */
+  @Transactional
   public void unsavePost(long postId, long userId) {
-    ensurePostExists(postId);
-    savedRepository.deleteByPostIdAndUserId(postId, userId);
+    savedPostRepository.findByPostIdAndUserId(postId, userId)
+        .ifPresent(savedPostRepository::delete);
   }
 
-  private void ensurePostExists(long postId) {
-    if (!postRepository.existsById(postId)) {
-      throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Post not found");
-    }
-  }
+  private void sendNotification(Long recipientId, String type, String title, String message) {
+      try {
+          Map<String, Object> body = new HashMap<>();
+          body.put("recipientId", String.valueOf(recipientId));
+          body.put("type", type);
+          body.put("title", title);
+          body.put("message", message);
 
-  private CommentResponse toCommentResponse(PostCommentEntity c) {
-    CommentResponse r = new CommentResponse();
-    r.setId(c.getId());
-    r.setText(c.getText());
-    r.setCreatedAt(c.getCreatedAt());
-    r.setUser(profileClient.getPublicProfile(c.getUserId()));
-    return r;
+          HttpHeaders headers = new HttpHeaders();
+          headers.set("X-Internal-Secret", internalSecret);
+          HttpEntity<Map<String, Object>> entity = new HttpEntity<>(body, headers);
+
+          restTemplate.postForObject("http://localhost:8084/api/notifications", entity, String.class);
+      } catch (Exception e) {
+          log.error("Failed to send notification: {}", e.getMessage());
+      }
   }
 }
